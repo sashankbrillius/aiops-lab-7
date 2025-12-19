@@ -1,0 +1,1151 @@
+================================================================================
+SMARTDINE RADAR WALL - COMPLETE CODEBASE
+================================================================================
+This file contains all source code files from the repository.
+Generated: Complete codebase dump
+================================================================================
+
+================================================================================
+ROOT DIRECTORY FILES
+================================================================================
+
+--------------------------------------------------------------------------------
+FILE: Dockerfile
+--------------------------------------------------------------------------------
+FROM ubuntu:22.04
+
+# Prevent interactive prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    curl \
+    wget \
+    jq \
+    bash \
+    ca-certificates \
+    python3 \
+    python3-pip \
+    supervisor \
+    unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Node.js 18
+RUN curl -fsSL https://deb.nodesource.com/setup_18.x | bash - && \
+    apt-get install -y nodejs && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install Prometheus
+ENV PROMETHEUS_VERSION=2.54.1
+RUN cd /tmp && \
+    wget -q https://github.com/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}/prometheus-${PROMETHEUS_VERSION}.linux-amd64.tar.gz && \
+    tar xzf prometheus-${PROMETHEUS_VERSION}.linux-amd64.tar.gz && \
+    mv prometheus-${PROMETHEUS_VERSION}.linux-amd64/prometheus /usr/local/bin/ && \
+    mv prometheus-${PROMETHEUS_VERSION}.linux-amd64/promtool /usr/local/bin/ && \
+    rm -rf prometheus-${PROMETHEUS_VERSION}*
+
+# Install Grafana OSS
+ENV GRAFANA_VERSION=11.2.0
+RUN cd /tmp && \
+    wget -q https://dl.grafana.com/oss/release/grafana_${GRAFANA_VERSION}_amd64.deb && \
+    apt-get install -y ./grafana_${GRAFANA_VERSION}_amd64.deb && \
+    rm -f grafana_${GRAFANA_VERSION}_amd64.deb && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install Loki
+ENV LOKI_VERSION=3.1.1
+RUN cd /tmp && \
+    wget -q https://github.com/grafana/loki/releases/download/v${LOKI_VERSION}/loki-linux-amd64.zip && \
+    unzip -q loki-linux-amd64.zip && \
+    mv loki-linux-amd64 /usr/local/bin/loki && \
+    chmod +x /usr/local/bin/loki && \
+    rm -f loki-linux-amd64.zip
+
+# Install Promtail
+ENV PROMTAIL_VERSION=3.1.1
+RUN cd /tmp && \
+    wget -q https://github.com/grafana/loki/releases/download/v${PROMTAIL_VERSION}/promtail-linux-amd64.zip && \
+    unzip -q promtail-linux-amd64.zip && \
+    mv promtail-linux-amd64 /usr/local/bin/promtail && \
+    chmod +x /usr/local/bin/promtail && \
+    rm -f promtail-linux-amd64.zip
+
+# Install OpenTelemetry Collector
+ENV OTEL_VERSION=0.104.0
+RUN cd /tmp && \
+    wget -q https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v${OTEL_VERSION}/otelcol-contrib_${OTEL_VERSION}_linux_amd64.tar.gz && \
+    tar xzf otelcol-contrib_${OTEL_VERSION}_linux_amd64.tar.gz && \
+    mv otelcol-contrib /usr/local/bin/otel-collector && \
+    chmod +x /usr/local/bin/otel-collector && \
+    rm -f otelcol-contrib_${OTEL_VERSION}_linux_amd64.tar.gz
+
+# Install Jaeger All-in-One
+ENV JAEGER_VERSION=1.57
+RUN cd /tmp && \
+    wget -q https://github.com/jaegertracing/jaeger/releases/download/v${JAEGER_VERSION}/jaeger-${JAEGER_VERSION}-linux-amd64.tar.gz && \
+    tar xzf jaeger-${JAEGER_VERSION}-linux-amd64.tar.gz && \
+    mv jaeger-${JAEGER_VERSION}-linux-amd64/jaeger-all-in-one /usr/local/bin/ && \
+    chmod +x /usr/local/bin/jaeger-all-in-one && \
+    rm -rf jaeger-${JAEGER_VERSION}*
+
+# Install ttyd
+RUN cd /tmp && \
+    wget -q https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64 && \
+    mv ttyd.x86_64 /usr/local/bin/ttyd && \
+    chmod +x /usr/local/bin/ttyd && \
+    rm -rf /tmp/*
+
+# Create lab directory and copy repo
+WORKDIR /lab
+COPY . .
+
+# Install Node.js dependencies for kitchen-api
+WORKDIR /lab/kitchen-api
+RUN npm install --omit=dev
+
+# Install Python dependencies for aiops-engine
+WORKDIR /lab/aiops-engine
+RUN pip3 install --no-cache-dir -r requirements.txt
+
+# Create directories for logs and runtime
+RUN mkdir -p /lab/run /lab/logs /var/log/kitchen /loki/chunks /loki/rules /tmp/positions /lab/prometheus/data && \
+    chown -R grafana:grafana /var/lib/grafana /var/log/grafana 2>/dev/null || true
+
+# Make start script executable
+RUN chmod +x /lab/start_all.sh
+
+# Expose all service ports
+EXPOSE 5101 7000 9090 3000 3100 4317 4318 16686 5102
+
+# Set entrypoint
+ENTRYPOINT ["/lab/start_all.sh"]
+
+
+--------------------------------------------------------------------------------
+FILE: start_all.sh
+--------------------------------------------------------------------------------
+#!/bin/bash
+set -e
+
+# Create log directory
+mkdir -p /lab/run
+
+# Function to cleanup on exit
+cleanup() {
+    echo ""
+    echo "=== Shutting down services ==="
+    kill $(jobs -p) 2>/dev/null || true
+    wait
+    echo "All services stopped."
+    exit 0
+}
+
+# Trap signals
+trap cleanup SIGTERM SIGINT
+
+# Function to start a service in background
+start_service() {
+    local name=$1
+    local cmd=$2
+    echo "Starting $name..."
+    $cmd > /lab/run/${name}.log 2>&1 &
+    echo "$!" > /lab/run/${name}.pid
+    sleep 2
+    if ! kill -0 $(cat /lab/run/${name}.pid) 2>/dev/null; then
+        echo "ERROR: $name failed to start. Check /lab/run/${name}.log"
+        tail -20 /lab/run/${name}.log
+        exit 1
+    fi
+    echo "  ✓ $name started (PID: $(cat /lab/run/${name}.pid))"
+}
+
+echo "=========================================="
+echo "  SmartDine AIOps Lab - Starting Services"
+echo "=========================================="
+echo ""
+
+# Start Loki first (needed by Promtail)
+start_service "loki" "/usr/local/bin/loki -config.file=/lab/loki/loki-config.yaml"
+
+# Start Promtail (depends on Loki)
+start_service "promtail" "/usr/local/bin/promtail -config.file=/lab/promtail/promtail-config.yaml"
+
+# Start Jaeger (needed by OTel collector)
+start_service "jaeger" "/usr/local/bin/jaeger-all-in-one --query.base-path=/"
+
+# Start OTel Collector (depends on Jaeger)
+start_service "otel-collector" "/usr/local/bin/otel-collector --config=/lab/otel-collector/otel-collector-config.yaml"
+
+# Start Prometheus
+start_service "prometheus" "/usr/local/bin/prometheus --config.file=/lab/prometheus/prometheus.yml --storage.tsdb.path=/lab/prometheus/data --web.enable-lifecycle"
+
+# Start Grafana (depends on Prometheus and Loki)
+start_service "grafana" "/usr/sbin/grafana-server --homepath=/usr/share/grafana --config=/etc/grafana/grafana.ini --packaging=deb cfg:default.paths.logs=/var/log/grafana cfg:default.paths.data=/var/lib/grafana cfg:default.paths.plugins=/var/lib/grafana/plugins cfg:default.paths.provisioning=/lab/grafana/provisioning"
+
+# Start AIOps Engine
+cd /lab/aiops-engine
+start_service "aiops-engine" "python3 app.py"
+
+# Start Kitchen API
+cd /lab/kitchen-api
+export PORT=5101
+export SERVICE_NAME=kitchen-api
+export ENV=lab
+export OWNER=platform
+export VERSION=v1.3
+export CHANGE_ID=MENU-200
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
+export OTEL_LOG_LEVEL=info
+export LOG_FILE=/var/log/kitchen/app.log
+start_service "kitchen-api" "node src/index.js"
+
+# Start ttyd web terminal
+start_service "ttyd" "/usr/local/bin/ttyd -p 5102 -t titleFixed='SmartDine AIOps Lab Terminal' -t fontSize=14 /bin/bash"
+
+echo ""
+echo "=========================================="
+echo "  Service Endpoints"
+echo "=========================================="
+echo "  Kitchen API:      http://localhost:5101/health"
+echo "  AIOps Engine:     http://localhost:7000/status"
+echo "  Prometheus:       http://localhost:9090"
+echo "  Grafana:          http://localhost:3000 (admin/admin)"
+echo "  Loki:             http://localhost:3100/ready"
+echo "  Jaeger UI:        http://localhost:16686"
+echo "  Web Terminal:     http://localhost:5102"
+echo "=========================================="
+echo ""
+echo "All services are running. Logs are in /lab/run/*.log"
+echo "Press Ctrl+C to stop all services."
+echo ""
+
+# Keep container alive and monitor processes
+while true; do
+    sleep 5
+    # Check if any critical service died
+    for pidfile in /lab/run/*.pid; do
+        if [ -f "$pidfile" ]; then
+            pid=$(cat "$pidfile")
+            if ! kill -0 "$pid" 2>/dev/null; then
+                echo "WARNING: Service $(basename $pidfile .pid) died. Check logs."
+            fi
+        fi
+    done
+done
+
+
+--------------------------------------------------------------------------------
+FILE: docker-compose.yml
+--------------------------------------------------------------------------------
+services:
+  kitchen-api:
+    build: ./kitchen-api
+    container_name: kitchen-api
+    environment:
+      PORT: "5101"
+      SERVICE_NAME: "kitchen-api"
+      ENV: "lab"
+      OWNER: "${OWNER:-platform}"
+      VERSION: "${VERSION:-v1.3}"
+      CHANGE_ID: "${CHANGE_ID:-MENU-200}"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
+      OTEL_LOG_LEVEL: "info"
+      LOG_FILE: "/var/log/kitchen/app.log"
+    ports:
+      - "5101:5101"
+    volumes:
+      - ./logs:/var/log/kitchen
+    depends_on:
+      - otel-collector
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.104.0
+    container_name: otel-collector
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    volumes:
+      - ./otel-collector/otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    ports:
+      - "4317:4317"   # OTLP gRPC (optional)
+      - "4318:4318"   # OTLP HTTP
+    depends_on:
+      - jaeger
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.57
+    container_name: jaeger
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    ports:
+      - "16686:16686"   # UI
+      - "14250:14250"   # gRPC ingest
+      - "14268:14268"   # HTTP ingest
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: prometheus
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      - kitchen-api
+
+  loki:
+    image: grafana/loki:3.1.1
+    container_name: loki
+    command: ["-config.file=/etc/loki/config.yaml"]
+    volumes:
+      - ./loki/loki-config.yaml:/etc/loki/config.yaml:ro
+    ports:
+      - "3100:3100"
+
+  promtail:
+    image: grafana/promtail:3.1.1
+    container_name: promtail
+    command: ["-config.file=/etc/promtail/config.yaml"]
+    volumes:
+      - ./promtail/promtail-config.yaml:/etc/promtail/config.yaml:ro
+      - ./logs:/var/log/kitchen:ro
+    depends_on:
+      - loki
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: "admin"
+      GF_SECURITY_ADMIN_PASSWORD: "admin"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+      - loki
+  aiops-engine:
+    build: ./aiops-engine
+    container_name: aiops-engine
+    ports:
+      - "7000:7000"
+    volumes:
+      - ./logs:/var/log/kitchen:ro
+    depends_on:
+      - kitchen-api
+
+
+--------------------------------------------------------------------------------
+FILE: README.md
+--------------------------------------------------------------------------------
+# SmartDine Kitchen Radar Wall (Lesson 7) — From Scratch
+
+This is a minimal, runnable lab that demonstrates **advanced observability**:
+- **Metrics** → Prometheus (histograms + counters)
+- **Logs** → Loki (file-scraped via Promtail)
+- **Traces** → Jaeger (exported via OpenTelemetry Collector)
+- **Change Signals** → `/change` + `/changes` (and logged)
+
+## Prereqs
+- Docker Desktop (or Docker Engine) with Compose
+
+## Run
+```bash
+docker compose up -d --build
+```
+
+Open:
+- Kitchen API health: http://localhost:5101/health
+- Prometheus:       http://localhost:9090
+- Grafana:          http://localhost:3000  (admin / admin)
+- Jaeger:           http://localhost:16686
+
+## Generate traffic (baseline)
+```bash
+# Baseline requests (promo OFF; change_id=MENU-200)
+./scripts/baseline_traffic.sh
+```
+
+## Introduce a bad change + traffic
+```bash
+# Switch to "bad change" (v1.4) + emit change event
+./scripts/apply_bad_change.sh
+
+# Generate traffic again (east should go slow + more refunds)
+./scripts/baseline_traffic.sh
+```
+
+## Useful queries
+### Prometheus (PromQL)
+p95 prep time per region:
+```promql
+histogram_quantile(
+  0.95,
+  sum(rate(smartdine_prep_time_ms_bucket[2m])) by (le, region, change_id)
+)
+```
+
+refund rate (per min):
+```promql
+sum(rate(smartdine_refunds_total[2m])) by (region, reason, change_id) * 60
+```
+
+### Grafana Explore → Loki
+Search for change + refunds:
+- `CHANGE_EVENT`
+- `REFUND_TAG`
+
+Tip: logs contain `trace_id`. Copy it and search in Jaeger.
+
+### Jaeger
+Service: `kitchen-api`
+Operation: `GET /order`
+Look for slow span: `kitchen_prep`
+
+## Reset to baseline
+```bash
+./scripts/reset_baseline.sh
+```
+
+## Run single-image lab
+
+This repository can also be run as a single Docker image containing all services in one container, including a web terminal.
+
+### Build the image
+```bash
+docker build -t smartdine-lab .
+```
+
+### Run the container
+```bash
+docker run --rm \
+  -p 5101:5101 -p 7000:7000 -p 9090:9090 -p 3000:3000 -p 3100:3100 \
+  -p 4317:4317 -p 4318:4318 -p 16686:16686 -p 5102:5102 \
+  smartdine-lab
+```
+
+### Access services
+Once the container is running, you can access:
+
+- **Kitchen API**: http://localhost:5101/health
+- **AIOps Engine**: http://localhost:7000/status
+- **Prometheus**: http://localhost:9090
+- **Grafana**: http://localhost:3000 (admin/admin)
+- **Loki**: http://localhost:3100/ready
+- **Jaeger UI**: http://localhost:16686
+- **Web Terminal**: http://localhost:5102
+
+All services run in the same container and communicate via localhost. Service logs are available in `/lab/run/*.log` inside the container or via the web terminal.
+
+### Notes
+- The single-image setup uses `localhost`/`127.0.0.1` for all inter-service communication
+- All binaries (Prometheus, Grafana, Loki, Promtail, OTel Collector, Jaeger, ttyd) are pre-installed
+- The container runs a startup script (`start_all.sh`) that launches all services in the correct order
+- Press Ctrl+C or send SIGTERM to gracefully shutdown all services
+
+
+================================================================================
+AIOPS-ENGINE DIRECTORY
+================================================================================
+
+--------------------------------------------------------------------------------
+FILE: aiops-engine/app.py
+--------------------------------------------------------------------------------
+import os, json
+import numpy as np
+from flask import Flask, request, jsonify
+from sklearn.ensemble import IsolationForest
+import joblib
+from prometheus_client import Gauge, generate_latest, CONTENT_TYPE_LATEST
+
+APP = Flask(__name__)
+
+MODEL_PATH = "/app/model.joblib"
+model = None
+
+g_anom = Gauge("aiops_anomaly_score", "Anomaly score (0-1)", ["region"])
+g_inc  = Gauge("aiops_incident_active", "1 if incident active else 0", ["region"])
+
+def read_events(log_path: str, tail: int = 5000):
+  # read last N lines to keep it fast
+  with open(log_path, "rb") as f:
+    f.seek(0, 2)
+    size = f.tell()
+    step = min(size, 1024 * 1024)
+    data = b""
+    while len(data.splitlines()) < tail and f.tell() > 0:
+      f.seek(max(0, f.tell() - step))
+      data = f.read(step) + data
+      f.seek(max(0, f.tell() - step))
+      if f.tell() == 0:
+        break
+  lines = data.splitlines()[-tail:]
+  out = []
+  for b in lines:
+    try:
+      o = json.loads(b.decode("utf-8", errors="ignore"))
+    except Exception:
+      continue
+    msg = o.get("msg")
+    if msg not in ("order_ok", "REFUND_TAG"):
+      continue
+    if "prep_time_ms" not in o or "region" not in o:
+      continue
+    refund = 1 if msg == "REFUND_TAG" else 0
+    out.append({
+      "region": o.get("region"),
+      "prep_time_ms": float(o.get("prep_time_ms")),
+      "refund": refund,
+      "change_id": o.get("change_id", "none"),
+      "recipe_version": o.get("recipe_version", "unknown"),
+      "time": o.get("time"),
+    })
+  return out
+
+def to_X(events):
+  # features for model: prep_time_ms, refund, region_is_east
+  X = []
+  for e in events:
+    region_is_east = 1.0 if str(e["region"]).lower() == "east" else 0.0
+    X.append([e["prep_time_ms"], float(e["refund"]), region_is_east])
+  return np.array(X, dtype=np.float32)
+
+@APP.get("/metrics")
+def metrics():
+  return generate_latest(), 200, {"Content-Type": CONTENT_TYPE_LATEST}
+
+@APP.post("/train_from_logs")
+def train():
+  global model
+  body = request.get_json(force=True)
+  log_path = body.get("log_path", "/var/log/kitchen/app.log")
+  baseline_change = (body.get("filter") or {}).get("change_id")
+  contamination = float(body.get("contamination", 0.05))
+  min_samples = int(body.get("min_samples", 50))
+  tail = int(body.get("tail", 5000))
+
+  events = read_events(log_path, tail=tail)
+  if baseline_change:
+    events = [e for e in events if e["change_id"] == baseline_change]
+
+  if len(events) < min_samples:
+    return jsonify({"ok": False, "error": f"not enough samples: {len(events)} (<{min_samples})"}), 400
+
+  X = to_X(events)
+  model = IsolationForest(n_estimators=200, contamination=contamination, random_state=42)
+  model.fit(X)
+  joblib.dump(model, MODEL_PATH)
+
+  return jsonify({"ok": True, "trained_on": len(events), "features": ["prep_time_ms","refund","region_is_east"]})
+
+@APP.post("/score_from_logs")
+def score():
+  global model
+  body = request.get_json(force=True)
+  log_path = body.get("log_path", "/var/log/kitchen/app.log")
+  tail = int(body.get("tail", 400))
+  threshold = float(body.get("threshold", 0.70))
+
+  if model is None and os.path.exists(MODEL_PATH):
+    model = joblib.load(MODEL_PATH)
+  if model is None:
+    return jsonify({"ok": False, "error": "model not trained"}), 400
+
+  events = read_events(log_path, tail=tail)
+  if not events:
+    return jsonify({"ok": False, "error": "no events found"}), 400
+
+  X = to_X(events)
+  # decision_function: higher = more normal -> convert to anomaly score 0..1
+  raw = -model.decision_function(X)
+  raw = (raw - raw.min()) / (raw.max() - raw.min() + 1e-9)
+
+  # update per-region gauges
+  by_region = {}
+  for e, s in zip(events, raw):
+    r = str(e["region"]).lower()
+    by_region.setdefault(r, []).append(float(s))
+
+  out = []
+  for r, scores in by_region.items():
+    avg = float(np.mean(scores))
+    active = 1.0 if avg >= threshold else 0.0
+    g_anom.labels(region=r).set(avg)
+    g_inc.labels(region=r).set(active)
+    out.append({"region": r, "avg_anomaly_score": avg, "incident_active": bool(active), "n": len(scores)})
+
+  return jsonify({"ok": True, "regions": out, "threshold": threshold})
+
+@APP.get("/status")
+def status():
+  return jsonify({"ok": True, "model_loaded": model is not None})
+  
+if __name__ == "__main__":
+  APP.run(host="0.0.0.0", port=7000)
+
+
+--------------------------------------------------------------------------------
+FILE: aiops-engine/Dockerfile
+--------------------------------------------------------------------------------
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY app.py .
+EXPOSE 7000
+CMD ["python", "app.py"]
+
+
+--------------------------------------------------------------------------------
+FILE: aiops-engine/requirements.txt
+--------------------------------------------------------------------------------
+flask==3.0.3
+prometheus-client==0.20.0
+scikit-learn==1.5.1
+numpy==2.0.2
+joblib==1.4.2
+
+
+================================================================================
+KITCHEN-API DIRECTORY
+================================================================================
+
+--------------------------------------------------------------------------------
+FILE: kitchen-api/src/index.js
+--------------------------------------------------------------------------------
+import fs from "node:fs";
+import path from "node:path";
+import express from "express";
+import pino from "pino";
+import pinoHttp from "pino-http";
+import client from "prom-client";
+import { trace, context } from "@opentelemetry/api";
+import { startTelemetry } from "./telemetry.js";
+
+await startTelemetry();
+const tracer = trace.getTracer("kitchen-api");
+const PORT = Number(process.env.PORT || 5101);
+const SERVICE = process.env.SERVICE_NAME || "kitchen-api";
+const ENV = process.env.ENV || "lab";
+const OWNER = process.env.OWNER || "unknown";
+const VERSION = process.env.VERSION || "v1.0";
+const CHANGE_ID = process.env.CHANGE_ID || "none";
+const LOG_FILE = process.env.LOG_FILE || "/var/log/kitchen/app.log";
+
+// Ensure log directory exists
+try {
+  fs.mkdirSync(path.dirname(LOG_FILE), { recursive: true });
+} catch (err) {
+  // Fall back to stdout-only logging if directory can't be created
+  console.warn("failed to prepare log directory", err);
+}
+
+const logStream = fs.createWriteStream(LOG_FILE, { flags: "a" });
+
+// pino multi-destination (stdout + file)
+const logger = pino(
+  { level: process.env.LOG_LEVEL || "info" },
+  pino.multistream([
+    { stream: process.stdout },
+    { stream: logStream },
+  ])
+);
+
+// Prometheus metrics
+client.collectDefaultMetrics();
+
+const prepTime = new client.Histogram({
+  name: "smartdine_prep_time_ms",
+  help: "Simulated kitchen prep time in ms",
+  labelNames: ["region", "recipe_version", "change_id"],
+  buckets: [50, 80, 120, 180, 250, 350, 500, 800, 1200, 2000],
+});
+
+const refunds = new client.Counter({
+  name: "smartdine_refunds_total",
+  help: "Refunds caused by food quality incidents",
+  labelNames: ["region", "reason", "change_id"],
+});
+
+const app = express();
+app.use(express.json({ limit: "256kb" }));
+
+// HTTP logging middleware (adds trace_id/span_id if present)
+app.use(
+  pinoHttp({
+    logger,
+    customProps: () => {
+      try {
+        const span = trace.getSpan(context.active());
+        const sc = span?.spanContext();
+        return {
+          service: SERVICE,
+          env: ENV,
+          owner: OWNER,
+          version: VERSION,
+          change_id: CHANGE_ID,
+          trace_id: sc?.traceId,
+          span_id: sc?.spanId,
+        };
+      } catch (e) {
+        // Never break requests because logging/tracing isn't ready
+        logger.warn({ err: e }, "failed to enrich log context; using defaults");
+        return {
+          service: SERVICE,
+          env: ENV,
+          owner: OWNER,
+          version: VERSION,
+          change_id: CHANGE_ID,
+        };
+      }
+    },
+  })
+);
+
+
+// In-memory change timeline
+const changeTimeline = [];
+
+app.get("/health", (_req, res) => {
+  res.json({
+    ok: true,
+    service: SERVICE,
+    env: ENV,
+    owner: OWNER,
+    version: VERSION,
+    change_id: CHANGE_ID,
+  });
+});
+
+app.get("/metrics", async (_req, res) => {
+  res.set("Content-Type", client.register.contentType);
+  res.send(await client.register.metrics());
+});
+
+app.post("/change", (req, res) => {
+  const body = req.body || {};
+  const event = {
+    ts: new Date().toISOString(),
+    change_id: String(body.change_id || CHANGE_ID),
+    version: String(body.version || VERSION),
+    owner: String(body.owner || OWNER),
+    description: String(body.description || ""),
+  };
+  changeTimeline.push(event);
+
+  req.log.info({ event_type: "CHANGE_EVENT", ...event }, "CHANGE_EVENT");
+  res.json({ status: "ok", event });
+});
+
+app.get("/changes", (_req, res) => {
+  res.json({ count: changeTimeline.length, changes: changeTimeline.slice(-50).reverse() });
+});
+
+// Simulated order endpoint with trace + metrics + logs
+app.get("/order", async (req, res) => {
+  const region = (req.query.region || "west").toString();
+  const recipeVersion = process.env.RECIPE_VERSION || VERSION;
+
+  tracer.startActiveSpan("order_journey", async (span) => {
+    try {
+      span.setAttribute("region", region);
+      const sc = span.spanContext();
+req.log = req.log.child({ trace_id: sc.traceId, span_id: sc.spanId });
+
+
+
+  // Base prep time
+  let base = region === "east" ? 140 : 90;
+
+  // Bad change: v1.4 in east slows + refunds more likely
+  const isBad = recipeVersion === "v1.4" && region === "east";
+  if (isBad) base += 260;
+
+  // jitter
+  const jitter = Math.floor(Math.random() * 60) - 20;
+  const prepMs = Math.max(20, base + jitter);
+
+  // simulate work
+  await new Promise((r) => setTimeout(r, prepMs));
+
+  // refunds probability
+  let refund = false;
+  let reason = "none";
+  const roll = Math.random();
+
+  if (isBad && roll < 0.28) {
+    refund = true;
+    reason = "undercooked_chicken";
+  } else if (!isBad && roll < 0.03) {
+    refund = true;
+    reason = "late_delivery";
+  }
+
+  // metrics
+  prepTime.labels(region, recipeVersion, CHANGE_ID).observe(prepMs);
+  if (refund) refunds.labels(region, reason, CHANGE_ID).inc();
+
+  // log
+  if (refund) {
+    req.log.warn(
+      {
+        tag: "REFUND_TAG",
+        region,
+        prep_time_ms: prepMs,
+        reason,
+        recipe_version: recipeVersion,
+        change_id: CHANGE_ID,
+      },
+      "REFUND_TAG"
+    );
+  } else {
+    req.log.info(
+      {
+        region,
+        prep_time_ms: prepMs,
+        recipe_version: recipeVersion,
+        change_id: CHANGE_ID,
+      },
+      "order_ok"
+    );
+  }
+
+      res.json({ ok: true, region });
+    } catch (e) {
+      span.recordException(e);
+      req.log.error({ err: e, region, change_id: CHANGE_ID }, "order_failed");
+      res.status(500).json({ ok: false, error: String(e) });
+    } finally {
+      span.end();
+    }
+  });
+});
+
+
+
+
+// Boot
+const sdk = await startTelemetry();
+process.on("SIGTERM", async () => {
+  try {
+    await sdk.shutdown();
+  } finally {
+    process.exit(0);
+  }
+});
+
+app.listen(PORT, () => {
+  logger.info(
+    {
+      service: SERVICE,
+      env: ENV,
+      owner: OWNER,
+      version: VERSION,
+      change_id: CHANGE_ID,
+      port: PORT,
+      log_file: LOG_FILE,
+    },
+    "kitchen-api up"
+  );
+});
+
+
+
+--------------------------------------------------------------------------------
+FILE: kitchen-api/src/telemetry.js
+--------------------------------------------------------------------------------
+import { NodeSDK } from "@opentelemetry/sdk-node";
+import resourcesPkg from "@opentelemetry/resources";
+import { SemanticResourceAttributes as SRA } from "@opentelemetry/semantic-conventions";
+import { getNodeAutoInstrumentations } from "@opentelemetry/auto-instrumentations-node";
+import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http";
+
+const { Resource } = resourcesPkg;
+
+/**
+ * Starts OpenTelemetry for the Kitchen API.
+ *
+ * Notes:
+ * - We intentionally use Resource (not resourceFromAttributes) to avoid
+ *   version / module-format differences in @opentelemetry/resources.
+ */
+export async function startTelemetry() {
+  const serviceName = process.env.SERVICE_NAME || "kitchen-api";
+  const env = process.env.ENV || "lab";
+  const version = process.env.VERSION || "v1.0";
+  const changeId = process.env.CHANGE_ID || "none";
+  const owner = process.env.OWNER || "unknown";
+
+  const otlpBase = process.env.OTEL_EXPORTER_OTLP_ENDPOINT || "http://127.0.0.1:4318";
+  const traceExporter = new OTLPTraceExporter({
+    url: `${otlpBase.replace(/\/$/, "")}/v1/traces`,
+  });
+
+  const resource = new Resource({
+    [SRA.SERVICE_NAME]: serviceName,
+    [SRA.DEPLOYMENT_ENVIRONMENT]: env,
+    [SRA.SERVICE_VERSION]: version,
+    "change_id": changeId,
+    "owner": owner,
+  });
+
+  const sdk = new NodeSDK({
+    resource,
+    traceExporter,
+    instrumentations: [
+      getNodeAutoInstrumentations({
+        // keep it simple for labs
+        "@opentelemetry/instrumentation-fs": { enabled: false },
+      }),
+    ],
+  });
+
+  await sdk.start();
+  return sdk;
+}
+
+
+--------------------------------------------------------------------------------
+FILE: kitchen-api/package.json
+--------------------------------------------------------------------------------
+{
+  "name": "kitchen-api",
+  "version": "1.0.0",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "@opentelemetry/api": "^1.9.0",
+    "@opentelemetry/auto-instrumentations-node": "^0.51.0",
+    "@opentelemetry/exporter-trace-otlp-http": "^0.52.0",
+    "@opentelemetry/resources": "^1.26.0",
+    "@opentelemetry/sdk-node": "^0.52.0",
+    "express": "^4.19.2",
+    "pino": "^9.3.2",
+    "pino-http": "^10.3.0",
+    "prom-client": "^15.1.3"
+  }
+}
+
+
+--------------------------------------------------------------------------------
+FILE: kitchen-api/Dockerfile
+--------------------------------------------------------------------------------
+FROM node:20-alpine
+
+WORKDIR /app
+
+COPY package.json package-lock.json* ./
+RUN npm install --omit=dev
+
+COPY src ./src
+
+ENV PORT=5101
+EXPOSE 5101
+
+CMD ["node", "src/index.js"]
+
+
+================================================================================
+PROMETHEUS DIRECTORY
+================================================================================
+
+--------------------------------------------------------------------------------
+FILE: prometheus/prometheus.yml
+--------------------------------------------------------------------------------
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: "aiops-engine"
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["127.0.0.1:7000"]
+  - job_name: "kitchen-api"
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["127.0.0.1:5101"]
+
+
+================================================================================
+LOKI DIRECTORY
+================================================================================
+
+--------------------------------------------------------------------------------
+FILE: loki/loki-config.yaml
+--------------------------------------------------------------------------------
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+
+common:
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+
+schema_config:
+  configs:
+    - from: 2023-01-01
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+ruler:
+  alertmanager_url: http://localhost:9093
+
+
+================================================================================
+PROMTAIL DIRECTORY
+================================================================================
+
+--------------------------------------------------------------------------------
+FILE: promtail/promtail-config.yaml
+--------------------------------------------------------------------------------
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+
+positions:
+  filename: /tmp/positions.yaml
+
+clients:
+  - url: http://127.0.0.1:3100/loki/api/v1/push
+
+scrape_configs:
+  - job_name: kitchen-api-file
+    static_configs:
+      - targets: [localhost]
+        labels:
+          job: kitchen-api
+          __path__: /var/log/kitchen/app.log
+
+
+================================================================================
+OTEL-COLLECTOR DIRECTORY
+================================================================================
+
+--------------------------------------------------------------------------------
+FILE: otel-collector/otel-collector-config.yaml
+--------------------------------------------------------------------------------
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+
+exporters:
+  debug:
+    verbosity: detailed
+  jaeger:
+    endpoint: http://127.0.0.1:14268/api/traces
+    tls:
+      insecure: true
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug, jaeger]
+
+
+================================================================================
+GRAFANA DIRECTORY
+================================================================================
+
+--------------------------------------------------------------------------------
+FILE: grafana/provisioning/datasources/datasources.yaml
+--------------------------------------------------------------------------------
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://127.0.0.1:9090
+    isDefault: true
+
+  - name: Loki
+    type: loki
+    access: proxy
+    url: http://127.0.0.1:3100
+
+
+================================================================================
+SCRIPTS DIRECTORY
+================================================================================
+
+--------------------------------------------------------------------------------
+FILE: scripts/apply_bad_change.sh
+--------------------------------------------------------------------------------
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "Applying bad change: VERSION=v1.4, CHANGE_ID=MENU-211 (simulated regression in east)"
+docker compose stop kitchen-api >/dev/null
+
+OWNER="kitchen-team" VERSION="v1.4" CHANGE_ID="MENU-211" docker compose up -d --build kitchen-api
+
+echo "Emitting change event..."
+curl -sS -X POST http://localhost:5101/change \
+  -H "Content-Type: application/json" \
+  -d '{"change_id":"MENU-211","version":"v1.4","owner":"kitchen-team","description":"Promo algorithm updated; east region regression"}'
+echo
+echo "Done."
+
+
+--------------------------------------------------------------------------------
+FILE: scripts/baseline_traffic.sh
+--------------------------------------------------------------------------------
+#!/usr/bin/env bash
+set -euo pipefail
+
+HOST="${HOST:-http://localhost:5101}"
+
+echo "Generating traffic to $HOST/order (east + west)..."
+for i in {1..40}; do
+  curl -sS "$HOST/order?region=east" > /dev/null
+  curl -sS "$HOST/order?region=west" > /dev/null
+done
+echo "Done."
+
+
+--------------------------------------------------------------------------------
+FILE: scripts/reset_baseline.sh
+--------------------------------------------------------------------------------
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "Resetting to baseline: VERSION=v1.3, CHANGE_ID=MENU-200"
+docker compose stop kitchen-api >/dev/null
+
+OWNER="platform" VERSION="v1.3" CHANGE_ID="MENU-200" docker compose up -d --build kitchen-api
+
+echo "Emitting baseline change event..."
+curl -sS -X POST http://localhost:5101/change \
+  -H "Content-Type: application/json" \
+  -d '{"change_id":"MENU-200","version":"v1.3","owner":"platform","description":"Baseline stable build"}'
+echo
+echo "Done."
+
+
+================================================================================
+END OF CODEBASE
+================================================================================
+

@@ -1,0 +1,5 @@
+flask==3.0.3
+prometheus-client==0.20.0
+scikit-learn==1.5.1
+numpy==2.0.2
+joblib==1.4.2

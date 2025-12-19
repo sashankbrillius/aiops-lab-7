@@ -1,0 +1,95 @@
+services:
+  kitchen-api:
+    build: ./kitchen-api
+    container_name: kitchen-api
+    environment:
+      PORT: "5101"
+      SERVICE_NAME: "kitchen-api"
+      ENV: "lab"
+      OWNER: "${OWNER:-platform}"
+      VERSION: "${VERSION:-v1.3}"
+      CHANGE_ID: "${CHANGE_ID:-MENU-200}"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
+      OTEL_LOG_LEVEL: "info"
+      LOG_FILE: "/var/log/kitchen/app.log"
+    ports:
+      - "5101:5101"
+    volumes:
+      - ./logs:/var/log/kitchen
+    depends_on:
+      - otel-collector
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.104.0
+    container_name: otel-collector
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    volumes:
+      - ./otel-collector/otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    ports:
+      - "4317:4317"   # OTLP gRPC (optional)
+      - "4318:4318"   # OTLP HTTP
+    depends_on:
+      - jaeger
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.57
+    container_name: jaeger
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    ports:
+      - "16686:16686"   # UI
+      - "14250:14250"   # gRPC ingest
+      - "14268:14268"   # HTTP ingest
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: prometheus
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      - kitchen-api
+
+  loki:
+    image: grafana/loki:3.1.1
+    container_name: loki
+    command: ["-config.file=/etc/loki/config.yaml"]
+    volumes:
+      - ./loki/loki-config.yaml:/etc/loki/config.yaml:ro
+    ports:
+      - "3100:3100"
+
+  promtail:
+    image: grafana/promtail:3.1.1
+    container_name: promtail
+    command: ["-config.file=/etc/promtail/config.yaml"]
+    volumes:
+      - ./promtail/promtail-config.yaml:/etc/promtail/config.yaml:ro
+      - ./logs:/var/log/kitchen:ro
+    depends_on:
+      - loki
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: "admin"
+      GF_SECURITY_ADMIN_PASSWORD: "admin"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+      - loki
+  aiops-engine:
+    build: ./aiops-engine
+    container_name: aiops-engine
+    ports:
+      - "7000:7000"
+    volumes:
+      - ./logs:/var/log/kitchen:ro
+    depends_on:
+      - kitchen-api
